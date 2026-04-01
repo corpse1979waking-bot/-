@@ -1,0 +1,11 @@
+```
+# Compiled Python files
+__pycache__/
+*.pyc
+
+# Database files
+*.db
+
+# Logs
+*.log
+```

@@ -24,8 +24,10 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, ADMIN_USER_IDS, PROXY_URL
+from config import BOT_TOKEN, MAIN_ADMIN_ID, DB_PATH, PROXY_URL
 import database as db
+import database_enhanced as de
+import bot_enhanced as be
 
 # ── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -48,9 +50,82 @@ DELETE_ID = 21
 
 def is_admin(update: Update) -> bool:
     """Проверяет что сообщение от администратора."""
-    if not ADMIN_USER_IDS:
-        return True  # если ID не задан — доступ всем (для первой настройки)
-    return update.effective_user.id in ADMIN_USER_IDS
+    user = update.effective_user
+    if not user:
+        return False
+    
+    # Проверяем в БД
+    db_user = db.get_user_by_telegram_id(user.id)
+    if db_user and db_user.get('role') == 'admin' and db_user.get('status') == 'active':
+        return True
+    
+    # Если это MAIN_ADMIN_ID — всегда админ
+    if MAIN_ADMIN_ID and user.id == MAIN_ADMIN_ID:
+        # Автоматически регистрируем если нет в БД
+        if not db_user:
+            de.register_user(user.id, user.username or '', user.full_name or '')
+            de.approve_user(db_user['id'] if db_user else de.add_user(user.id, user.username or '', user.full_name or '', 'admin', 'active'), 'admin')
+        return True
+    
+    return False
+
+
+def get_user_or_register(update: Update) -> dict | None:
+    """Получает пользователя из БД или регистрирует нового."""
+    user = update.effective_user
+    if not user:
+        return None
+    
+    db_user = db.get_user_by_telegram_id(user.id)
+    if db_user:
+        # Обновляем данные если изменились
+        if db_user.get('username') != user.username or db_user.get('full_name') != user.full_name:
+            db.update_user(db_user['id'], username=user.username, full_name=user.full_name)
+            db_user = db.get_user_by_telegram_id(user.id)
+        return db_user
+    
+    # Регистрируем нового
+    return de.register_user(user.id, user.username or '', user.full_name or '')
+
+
+def check_user_access(update: Update) -> tuple[bool, str]:
+    """
+    Проверяет доступ пользователя.
+    Возвращает (has_access, message).
+    """
+    user = update.effective_user
+    if not user:
+        return False, "❌ Не удалось определить пользователя"
+    
+    db_user = db.get_user_by_telegram_id(user.id)
+    
+    if not db_user:
+        return False, "pending"  # special marker for pending registration
+    
+    if db_user.get('status') == 'rejected':
+        return False, "❌ Ваша регистрация отклонена администратором"
+    
+    if db_user.get('status') == 'pending':
+        return False, "⏳ Ваша заявка на регистрацию ожидает одобрения администратором"
+    
+    if db_user.get('status') != 'active':
+        return False, "❌ Ваш аккаунт не активен"
+    
+    return True, db_user.get('role', 'guest')
+
+
+def format_user_list(users: list[dict]) -> str:
+    """Форматирует список пользователей для отображения."""
+    if not users:
+        return "Пользователей нет"
+    
+    lines = []
+    for u in users:
+        role_emoji = {'admin': '👑', 'operator': '📞', 'guest': '👤'}.get(u.get('role'), '👤')
+        status_emoji = {'active': '✅', 'pending': '⏳', 'rejected': '❌'}.get(u.get('status'), '⏳')
+        lines.append(f"{role_emoji} {status_emoji} {u.get('full_name') or u.get('username') or 'Unknown'} (@{u.get('username') or '-'})")
+    
+    return "\n".join(lines)
 
 
 def parse_date(text: str) -> str | None:
@@ -126,48 +201,160 @@ def normalize_phone(raw: str) -> str:
     return digits
 
 
-def format_call(call: dict) -> str:
+def format_call(call: dict, show_assignment: bool = True) -> str:
     """Форматирует запись звонка для отображения в Telegram."""
     remind = call.get("remind_date") or "—"
     notes = call.get("notes") or "—"
     reminded_mark = " ✅" if call.get("reminded") else ""
-    return (
-        f"📞 <b>#{call['id']}</b>\n"
+    
+    # Статус с эмодзи
+    status_emoji = {
+        'Новый': '🆕',
+        'В работе': '⏳',
+        'На связи': '📞',
+        'Отложен': '⏸️',
+        'Закрыт': '✅',
+        'Не заинтересован': '❌'
+    }.get(call.get('status', ''), '📝')
+    
+    text = (
+        f"📞 <b>#{call['id']}</b> {status_emoji} <b>{call.get('status', 'Новый')}</b>\n"
         f"  Телефон: <code>{call['phone']}</code>\n"
         f"  ФИО: {call['name']}\n"
         f"  Дата звонка: {call['call_date']}\n"
         f"  Напомнить: {remind}{reminded_mark}\n"
         f"  Примечание: {notes}"
     )
+    
+    # Информация о назначении
+    if show_assignment:
+        assigned_to = call.get('assigned_to')
+        if assigned_to:
+            assignee = db.get_user_by_telegram_id(assigned_to) if isinstance(assigned_to, int) else None
+            if hasattr(assignee, 'get'):
+                text += f"\n  👤 Исполнитель: {assignee.get('full_name') or assignee.get('username') or 'Unknown'}"
+            else:
+                # Пробуем получить по ID из БД
+                assignee_data = db.get_user_by_telegram_id(assigned_to)
+                if assignee_data:
+                    text += f"\n  👤 Исполнитель: {assignee_data.get('full_name') or assignee_data.get('username') or 'Unknown'}"
+        
+        created_by = call.get('created_by')
+        if created_by:
+            creator = db.get_user_by_telegram_id(created_by)
+            if creator:
+                text += f"\n  📝 Создал: {creator.get('full_name') or creator.get('username') or 'Unknown'}"
+    
+    return text
+
+
+def format_call_inline(call: dict) -> str:
+    """Короткий формат для inline-кнопок и списков."""
+    status_emoji = {
+        'Новый': '🆕',
+        'В работе': '⏳',
+        'На связи': '📞',
+        'Отложен': '⏸️',
+        'Закрыт': '✅',
+        'Не заинтересован': '❌'
+    }.get(call.get('status', ''), '📝')
+    
+    return f"#{call['id']} {status_emoji} {call['name']} ({call['phone']})"
 
 
 # ── Команды ──────────────────────────────────────────────────
 
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["📝 Новая запись", "📋 Список"],
-            ["📊 Выгрузить в Excel", "⚡ Быстрая запись"],
-            ["🔍 Поиск", "✏️ Редактировать", "🗑 Удалить"],
-            ["📋 Пропущенные"]
-        ],
-        resize_keyboard=True
-    )
+def get_main_keyboard(role: str = 'guest'):
+    """Возвращает главное меню в зависимости от роли."""
+    if role == 'admin':
+        return ReplyKeyboardMarkup(
+            [
+                ["📝 Новая запись", "📋 Список"],
+                ["📊 Выгрузить в Excel", "⚡ Быстрая запись"],
+                ["🔍 Поиск", "✏️ Редактировать", "🗑 Удалить"],
+                ["📋 Пропущенные", "👥 Пользователи"],
+                ["📊 Статистика", "🎯 Мои звонки"]
+            ],
+            resize_keyboard=True
+        )
+    elif role == 'operator':
+        return ReplyKeyboardMarkup(
+            [
+                ["📝 Новая запись", "📋 Список"],
+                ["📊 Выгрузить в Excel", "⚡ Быстрая запись"],
+                ["🔍 Поиск", "✏️ Редактировать"],
+                ["📋 Пропущенные", "🎯 Мои звонки"]
+            ],
+            resize_keyboard=True
+        )
+    else:  # guest
+        return ReplyKeyboardMarkup(
+            [
+                ["📋 Список", "🔍 Поиск"],
+                ["🎯 Мои звонки"]
+            ],
+            resize_keyboard=True
+        )
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /start — приветствие и инструкция."""
-    if not is_admin(update):
+    """Обработчик /start — приветствие и регистрация."""
+    user = update.effective_user
+    if not user:
         return
-
+    
+    # Регистрируем или получаем пользователя
+    db_user = get_user_or_register(update)
+    
+    # Проверяем доступ
+    has_access, status = check_user_access(update)
+    
+    if not has_access:
+        if status == "pending":
+            await update.message.reply_text(
+                f"👋 <b>{user.full_name or user.username}</b>, добро пожаловать!\n\n"
+                "⏳ Ваша заявка на регистрацию отправлена администратору.\n"
+                "После одобрения вы получите доступ к системе.",
+                parse_mode="HTML"
+            )
+            # Уведомляем админов
+            admins = [u for u in db.get_all_users() if u.get('role') == 'admin' and u.get('status') == 'active']
+            for admin in admins:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin['telegram_id'],
+                        text=f"🔔 <b>Новая заявка на регистрацию!</b>\n\n"
+                             f"👤 {user.full_name or user.username}\n"
+                             f"@{user.username or 'нет username'}\n\n"
+                             f"Используйте /users для просмотра и одобрения.",
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления админа: {e}")
+            return
+        else:
+            await update.message.reply_text(status)
+            return
+    
+    role = db_user.get('role', 'guest')
+    
     await update.message.reply_text(
-        "👋 <b>База звонков</b>\n\n"
-        "Выбери действие в меню или используй команды:\n"
-        "🗑 /delete <code>ID</code> — удалить запись\n\n"
+        f"👋 <b>База звонков</b>\n\n"
+        f"Добро пожаловать, <b>{db_user.get('full_name') or user.username}</b>!\n"
+        f"Ваша роль: <b>{role}</b>\n\n"
+        "Выбери действие в меню:\n\n"
+        "<b>Команды:</b>\n"
+        "📝 /new — новая запись звонка\n"
+        "⚡ /quick — быстрая запись\n"
+        "🔍 /search — поиск по базе\n"
+        "📋 /list — последние записи\n"
+        "🎯 /my_calls — мои звонки\n"
+        "📊 /stats — статистика\n"
+        "👥 /users — пользователи (админам)\n\n"
         "<b>Быстрая запись:</b>\n"
-        "<code>/quick 79991234567 | Иванов Иван | 09.03.2026 | 12.03.2026 14:00 | Перезвонить по КП</code>\n\n"
-        "Поля разделяй символом <code>|</code>",
+        "<code>/quick 79991234567 | Иванов Иван | 09.03.2026 | 12.03.2026 14:00 | Перезвонить по КП</code>",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
+        reply_markup=get_main_keyboard(role),
     )
 
 
@@ -959,22 +1146,260 @@ async def quick_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def cmd_missed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать пропущенные/необработанные напоминания."""
-    if not is_admin(update):
+    has_access, status = check_user_access(update)
+    if not has_access:
+        await update.message.reply_text(status if status != "pending" else "⏳ Ваша заявка ожидает одобрения")
         return
-
+    
     calls = db.get_unacknowledged_reminders()
     if not calls:
         await update.message.reply_text("✅ Нет пропущенных напоминаний!")
         return
-
+    
     header = f"📋 <b>Пропущенные напоминания: {len(calls)}</b>\n\n"
     text = header + "\n\n".join(format_call(c) for c in calls)
-
+    
     if len(text) > 4000:
         text = header + "\n\n".join(format_call(c) for c in calls[:10])
         text += f"\n\n<i>Показаны первые 10 из {len(calls)}</i>"
-
+    
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ── Новые команды для многопользовательской работы ───────────
+
+async def cmd_my_calls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать звонки, назначенные на текущего пользователя."""
+    has_access, status = check_user_access(update)
+    if not has_access:
+        await update.message.reply_text(status if status != "pending" else "⏳ Ваша заявка ожидает одобрения")
+        return
+    
+    user = update.effective_user
+    db_user = db.get_user_by_telegram_id(user.id)
+    
+    if not db_user:
+        await update.message.reply_text("❌ Пользователь не найден. Используйте /start")
+        return
+    
+    # Получаем статус из аргументов или показываем все
+    args = context.args
+    status_filter = args[0] if args else None
+    
+    if status_filter and status_filter not in de.VALID_STATUSES:
+        await update.message.reply_text(
+            f"❌ Недопустимый статус. Доступные: {', '.join(de.VALID_STATUSES)}"
+        )
+        return
+    
+    calls = de.get_my_calls(db_user['id'], status=status_filter)
+    
+    if not calls:
+        status_text = f" со статусом '{status_filter}'" if status_filter else ""
+        await update.message.reply_text(f"🎯 У вас нет звонков{status_text}")
+        return
+    
+    header = f"🎯 <b>Мои звонки{': ' + status_filter if status_filter else ''} ({len(calls)})</b>\n\n"
+    text = header + "\n\n".join(format_call(c) for c in calls[:10])
+    
+    if len(calls) > 10:
+        text += f"\n\n<i>Показаны первые 10 из {len(calls)}</i>"
+    
+    # Inline кнопки для быстрой фильтрации
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Новые", callback_data=f"mycalls:Новый"),
+         InlineKeyboardButton("⏳ В работе", callback_data=f"mycalls:В работе")],
+        [InlineKeyboardButton("✅ Закрытые", callback_data=f"mycalls:Закрыт"),
+         InlineKeyboardButton("❌ Отказы", callback_data=f"mycalls:Не заинтересован")],
+    ])
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику по звонкам."""
+    has_access, status = check_user_access(update)
+    if not has_access:
+        await update.message.reply_text(status if status != "pending" else "⏳ Ваша заявка ожидает одобрения")
+        return
+    
+    user = update.effective_user
+    db_user = db.get_user_by_telegram_id(user.id)
+    
+    # Общая статистика
+    stats = de.get_dashboard_stats()
+    
+    text = (
+        f"📊 <b>Статистика базы звонков</b>\n\n"
+        f"<b>Всего звонков:</b> {stats['total']}\n\n"
+        f"<b>По статусам:</b>\n"
+    )
+    
+    for status_name, count in stats['by_status'].items():
+        emoji = {'Новый': '🆕', 'В работе': '⏳', 'На связи': '📞', 
+                 'Отложен': '⏸️', 'Закрыт': '✅', 'Не заинтересован': '❌'}.get(status_name, '📝')
+        text += f"  {emoji} {status_name}: {count}\n"
+    
+    text += (
+        f"\n<b>За сегодня:</b> {stats['today']}\n"
+        f"<b>За неделю:</b> {stats['week']}\n"
+        f"<b>За месяц:</b> {stats['month']}\n"
+        f"\n<b>Просроченные:</b> {'⚠️' if stats['overdue'] > 0 else '✅'} {stats['overdue']}\n"
+        f"<b>Конверсия:</b> {stats['conversion_rate']}%"
+    )
+    
+    # Личная статистика если пользователь не гость
+    if db_user and db_user.get('role') != 'guest':
+        user_stats = de.get_user_stats(db_user['id'])
+        text += (
+            f"\n\n<b>👤 Ваша статистика:</b>\n"
+            f"  Создано: {user_stats['created']}\n"
+            f"  Назначено: {user_stats['assigned']}\n"
+            f"  Завершено: {user_stats['completed']}\n"
+            f"  Конверсия: {user_stats['completion_rate']}%"
+        )
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление пользователями (только для админов)."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ Только администраторы могут управлять пользователями")
+        return
+    
+    args = context.args
+    
+    if not args:
+        # Показать список пользователей
+        pending = de.get_pending_users()
+        active = de.get_active_users()
+        
+        text = "<b>👥 Пользователи системы</b>\n\n"
+        
+        if pending:
+            text += f"<b>⏳ Ожидают одобрения ({len(pending)}):</b>\n"
+            text += format_user_list(pending) + "\n\n"
+        
+        if active:
+            text += f"<b>✅ Активные ({len(active)}):</b>\n"
+            text += format_user_list(active)
+        
+        text += (
+            "\n\n<b>Команды:</b>\n"
+            "/approve &lt;user_id&gt; [role] — одобрить пользователя\n"
+            "/reject &lt;user_id&gt; — отклонить\n"
+            "Роли: admin, operator, guest (по умолчанию operator)"
+        )
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+    
+    # Обработка подкоманд
+    command = args[0].lower()
+    
+    if command == 'pending':
+        pending = de.get_pending_users()
+        if not pending:
+            await update.message.reply_text("✅ Нет заявок на одобрение")
+            return
+        text = "<b>⏳ Заявки на одобрение:</b>\n\n" + format_user_list(pending)
+        await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Одобрить пользователя (админ)."""
+    if not is_admin(update):
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Использование: /approve &lt;user_id&gt; [role]")
+        return
+    
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id должен быть числом")
+        return
+    
+    role = args[1] if len(args) > 1 else 'operator'
+    
+    if de.approve_user(user_id, role):
+        # Уведомляем пользователя
+        approved_user = db.get_user_by_telegram_id(user_id) if hasattr(db, 'get_user_by_telegram_id') else None
+        # Пробуем получить telegram_id
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        user_data = conn.execute("SELECT telegram_id FROM users WHERE id = ?", (user_id,)).fetchone()
+        conn.close()
+        
+        if user_data:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_data['telegram_id'],
+                    text=f"✅ Ваша регистрация одобрена!\nРоль: <b>{role}</b>\n\nИспользуйте /start для начала работы.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка уведомления пользователя: {e}")
+        
+        await update.message.reply_text(f"✅ Пользователь #{user_id} одобрен с ролью {role}")
+    else:
+        await update.message.reply_text(f"❌ Не удалось одобрить пользователя #{user_id}")
+
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отклонить пользователя (админ)."""
+    if not is_admin(update):
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Использование: /reject &lt;user_id&gt;")
+        return
+    
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id должен быть числом")
+        return
+    
+    if de.reject_user(user_id):
+        await update.message.reply_text(f"❌ Пользователь #{user_id} отклонен")
+    else:
+        await update.message.reply_text(f"❌ Не удалось отклонить пользователя #{user_id}")
+
+
+async def handle_mycalls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка inline-кнопок моих звонков."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not query.data.startswith("mycalls:"):
+        return
+    
+    status = query.data.split(":")[1]
+    user = update.effective_user
+    db_user = db.get_user_by_telegram_id(user.id)
+    
+    if not db_user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+    
+    calls = de.get_my_calls(db_user['id'], status=status)
+    
+    if not calls:
+        await query.edit_message_text(f"🎯 У вас нет звонков со статусом '{status}'")
+        return
+    
+    text = f"🎯 <b>Мои звонки: {status} ({len(calls)})</b>\n\n"
+    text += "\n\n".join(format_call(c) for c in calls[:10])
+    
+    if len(calls) > 10:
+        text += f"\n\n<i>Показаны первые 10 из {len(calls)}</i>"
+    
+    await query.edit_message_text(text, parse_mode="HTML")
 
 
 # ── Запуск бота ───────────────────────────────────────────────
@@ -1106,6 +1531,10 @@ def main():
 
     # Инлайн-кнопки напоминаний
     app.add_handler(CallbackQueryHandler(handle_remind_callback, pattern=r"^remind:"))
+    
+    # Обработчики расширенных функций (многопользовательский режим)
+    for handler in be.get_enhanced_handlers():
+        app.add_handler(handler)
 
     # Быстрое редактирование примечания из напоминания (низкий приоритет, группа 1)
     app.add_handler(
