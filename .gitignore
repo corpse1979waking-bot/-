@@ -1,11 +1,1 @@
-```
-# Compiled Python files
-__pycache__/
-*.pyc
-
-# Database files
-*.db
-
-# Logs
-*.log
-```
+Nothing should be ignored since the changes only include source code files (.py) without any build artifacts, dependencies, or temporary files.

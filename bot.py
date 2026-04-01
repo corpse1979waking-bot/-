@@ -54,17 +54,21 @@ def is_admin(update: Update) -> bool:
     if not user:
         return False
     
-    # Проверяем в БД
-    db_user = db.get_user_by_telegram_id(user.id)
-    if db_user and db_user.get('role') == 'admin' and db_user.get('status') == 'active':
-        return True
-    
-    # Если это MAIN_ADMIN_ID — всегда админ
+    # Если это MAIN_ADMIN_ID — всегда админ, автоматически активируем
     if MAIN_ADMIN_ID and user.id == MAIN_ADMIN_ID:
-        # Автоматически регистрируем если нет в БД
+        # Автоматически регистрируем если нет в БД или обновляем статус
+        db_user = db.get_user_by_telegram_id(user.id)
         if not db_user:
             de.register_user(user.id, user.username or '', user.full_name or '')
-            de.approve_user(db_user['id'] if db_user else de.add_user(user.id, user.username or '', user.full_name or '', 'admin', 'active'), 'admin')
+            db_user = db.get_user_by_telegram_id(user.id)
+        # Убеждаемся что статус active и роль admin
+        if db_user and (db_user.get('status') != 'active' or db_user.get('role') != 'admin'):
+            de.update_user(db_user['id'], role='admin', status='active')
+        return True
+    
+    # Проверяем в БД для остальных пользователей
+    db_user = db.get_user_by_telegram_id(user.id)
+    if db_user and db_user.get('role') == 'admin' and db_user.get('status') == 'active':
         return True
     
     return False

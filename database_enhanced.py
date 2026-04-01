@@ -73,6 +73,35 @@ def reject_user(user_id: int) -> bool:
     return update_user(user_id, status='rejected')
 
 
+def update_user(user_id: int, **fields) -> bool:
+    """
+    Обновляет поля пользователя.
+    Поля: role, status, username, full_name
+    """
+    if not fields:
+        return False
+    
+    # Проверяем что user_id существует
+    conn = get_connection()
+    existing = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not existing:
+        # Пробуем найти по telegram_id
+        existing = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,)).fetchone()
+        if existing:
+            user_id = existing['id']
+        else:
+            conn.close()
+            return False
+    
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [user_id]
+    cursor = conn.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+
 def get_pending_users() -> list[dict]:
     """Возвращает список пользователей, ожидающих одобрения."""
     conn = get_connection()
